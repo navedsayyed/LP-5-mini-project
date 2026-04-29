@@ -15,6 +15,7 @@ venv/
 
 # ---- Large binary files ----
 *.whl
+*.caffemodel
 
 # ---- IDE / Editor ----
 .vscode/

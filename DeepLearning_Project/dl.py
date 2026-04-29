@@ -2,6 +2,8 @@ import cv2
 import face_recognition
 import os
 import numpy as np
+import sys
+import threading
 
 # ---------------- PREPROCESS FUNCTION ----------------
 def preprocess_image(img):
@@ -37,6 +39,30 @@ def preprocess_image(img):
     img = np.ascontiguousarray(img)
 
     return img
+
+
+# ---------------- LOAD AGE & GENDER MODELS ----------------
+MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
+AGE_BUCKETS = ['(0-2)', '(4-6)', '(8-12)', '(15-20)',
+               '(25-32)', '(38-43)', '(48-53)', '(60-100)']
+GENDER_LIST = ['Male', 'Female']
+
+age_net = None
+gender_net = None
+
+age_proto = 'models/age_deploy.prototxt'
+age_model = 'models/age_net.caffemodel'
+gender_proto = 'models/gender_deploy.prototxt'
+gender_model = 'models/gender_net.caffemodel'
+
+if os.path.exists(age_model) and os.path.exists(gender_model):
+    age_net = cv2.dnn.readNet(age_proto, age_model)
+    gender_net = cv2.dnn.readNet(gender_proto, gender_model)
+    print("✅ Age & Gender models loaded")
+else:
+    print("⚠️  Age/Gender model weights not found.")
+    print("   Run:  python download_models.py")
+    print("   Continuing with face recognition only...\n")
 
 
 # ---------------- LOAD DATASET ----------------
@@ -86,11 +112,30 @@ encodeListKnown = findEncodings(images)
 print("\n✅ Encoding Complete\n")
 
 
-import sys
-import threading
+# ---------------- PREDICT AGE & GENDER ----------------
+def predict_age_gender(face_bgr):
+    """Takes a BGR face crop, returns (gender_str, age_str)."""
+    if age_net is None or gender_net is None:
+        return ("", "")
+
+    blob = cv2.dnn.blobFromImage(
+        face_bgr, 1.0, (227, 227), MODEL_MEAN_VALUES, swapRB=False
+    )
+
+    # Gender
+    gender_net.setInput(blob)
+    gender_preds = gender_net.forward()
+    gender = GENDER_LIST[gender_preds[0].argmax()]
+
+    # Age
+    age_net.setInput(blob)
+    age_preds = age_net.forward()
+    age = AGE_BUCKETS[age_preds[0].argmax()]
+
+    return (gender, age)
+
 
 # ---------------- WEBCAM ----------------
-# Use index 0 by default, or take it from command line argument
 cam_index = 0
 if len(sys.argv) > 1:
     try:
@@ -100,37 +145,33 @@ if len(sys.argv) > 1:
 
 print(f"Opening camera index: {cam_index}...")
 cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize internal buffer lag
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 # ----------- THREADED FACE PROCESSING -----------
-# Shared state between the background thread and main loop
 lock = threading.Lock()
-latest_frame = None          # frame to process (set by main loop)
-display_results = []         # list of (name, faceLoc) ready to draw
-processing_busy = False      # True while the bg thread is working
+latest_frame = None
+display_results = []       # list of (name, gender, age, faceLoc)
+processing_busy = False
 stop_event = threading.Event()
 
 
 def face_processing_thread():
-    """Runs in background: picks up frames, detects + recognises faces,
-    and writes results back into display_results without blocking the
-    main camera loop."""
+    """Detects faces, recognises identity, and predicts age+gender
+    in a background thread so the camera feed stays smooth."""
     global latest_frame, display_results, processing_busy
 
     while not stop_event.is_set():
-        # grab a frame to process
         with lock:
             frame = latest_frame
-            latest_frame = None  # consume it
+            latest_frame = None
 
         if frame is None:
-            # nothing to do – sleep briefly so we don't spin-lock
             stop_event.wait(0.01)
             continue
 
         processing_busy = True
 
-        # --- heavy work happens here (off the main thread) ---
+        # --- face detection on a small frame ---
         small = cv2.resize(frame, (0, 0), None, 0.25, 0.25)
         rgb_small = preprocess_image(small)
 
@@ -145,28 +186,36 @@ def face_processing_thread():
 
         results = []
         for encode_face, face_loc in zip(face_encodings, face_locations):
-            if len(encodeListKnown) == 0:
-                results.append(("UNKNOWN", face_loc))
-                continue
-
-            matches = face_recognition.compare_faces(encodeListKnown, encode_face, tolerance=0.5)
-            face_dis = face_recognition.face_distance(encodeListKnown, encode_face)
-            match_index = np.argmin(face_dis)
-
+            # --- Name recognition ---
             name = "UNKNOWN"
-            if matches[match_index]:
-                name = classNames[match_index].upper()
+            if len(encodeListKnown) > 0:
+                matches = face_recognition.compare_faces(
+                    encodeListKnown, encode_face, tolerance=0.5
+                )
+                face_dis = face_recognition.face_distance(encodeListKnown, encode_face)
+                match_index = np.argmin(face_dis)
+                if matches[match_index]:
+                    name = classNames[match_index].upper()
 
-            results.append((name, face_loc))
+            # --- Age & Gender prediction ---
+            # Crop face from the ORIGINAL full-size frame (better quality)
+            top, right, bottom, left = face_loc
+            top    = max(0, top * 4 - 20)
+            right  = min(frame.shape[1], right * 4 + 20)
+            bottom = min(frame.shape[0], bottom * 4 + 20)
+            left   = max(0, left * 4 - 20)
 
-        # publish results atomically
+            face_crop = frame[top:bottom, left:right]
+            gender, age = predict_age_gender(face_crop)
+
+            results.append((name, gender, age, face_loc))
+
         with lock:
             display_results = results
 
         processing_busy = False
 
 
-# start the worker
 worker = threading.Thread(target=face_processing_thread, daemon=True)
 worker.start()
 
@@ -179,28 +228,37 @@ while True:
     if not success or img is None:
         continue
 
-    # Feed a frame to the background thread every 3 frames
-    # (only if it is not still busy with the previous one)
     frame_count += 1
     if frame_count % 3 == 0 and not processing_busy:
         with lock:
             latest_frame = img.copy()
 
-    # Draw the latest cached results – zero heavy computation here
+    # Draw cached results
     with lock:
         results_snapshot = list(display_results)
 
-    for name, face_loc in results_snapshot:
+    for name, gender, age, face_loc in results_snapshot:
         y1, x2, y2, x1 = face_loc
         y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
 
+        # Green box around the face
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # --- TOP label: Gender (Age) ---
+        if gender and age:
+            top_label = f"{gender} {age}"
+            cv2.rectangle(img, (x1, y1 - 35), (x2, y1), (0, 255, 0), cv2.FILLED)
+            cv2.putText(img, top_label, (x1 + 6, y1 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (255, 255, 255), 2)
+
+        # --- BOTTOM label: Name ---
         cv2.rectangle(img, (x1, y2 - 35), (x2, y2), (0, 255, 0), cv2.FILLED)
         cv2.putText(img, name, (x1 + 6, y2 - 6),
                     cv2.FONT_HERSHEY_COMPLEX, 1,
                     (255, 255, 255), 2)
 
-    cv2.imshow('Recognized', img)
+    cv2.imshow('Face Recognition + Age & Gender', img)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
