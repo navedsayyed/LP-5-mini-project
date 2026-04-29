@@ -117,8 +117,3 @@ python hpc.py
 - Webcam (for the DL project)
 - Windows OS (tested on Windows 10/11)
 
----
-
-## 📄 License
-
-This project is for academic/educational purposes (SPPU LP-5 End Semester).
