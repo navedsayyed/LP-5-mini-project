@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# ---- Virtual Environments ----
+dl_env/
+face_env/
+venv/
+.env/
+
+# ---- Large binary files ----
+*.whl
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- OS junk ----
+Thumbs.db
+Desktop.ini
+.DS_Store
