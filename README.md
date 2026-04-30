@@ -1,4 +1,4 @@
-# LP-5 Mini Project — End Semester
+# LP-5 Mini Project
 
 This repository contains two projects for the LP-5 End Semester submission:
 
